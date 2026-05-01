@@ -118,7 +118,7 @@ def generate_test_cases(tz_text: str) -> list[dict]:
     if len(tz_text) > 8000:
         tz_text = tz_text[:8000] + "\n...[truncated]"
     msg = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-haiku-4-5-20251001",
         max_tokens=4096,
         system=SYSTEM,
         messages=[{"role": "user", "content": f"Requirements:\n\n{tz_text}"}],
