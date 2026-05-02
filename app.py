@@ -1,149 +1,247 @@
 import streamlit as st
-import torch, json, re, io, tempfile
-from pathlib import Path
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration, BitsAndBytesConfig
+import requests
+import json
+import re
+import io
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
 
-st.set_page_config(page_title="Test Case Generator", page_icon="🧪", layout="wide")
-st.title("🧪 Test Case Generator from Requirements")
-st.markdown("**Model:** Qwen2.5-VL-3B-Instruct")
-
-@st.cache_resource(show_spinner="Loading model...")
-def load_model():
-    MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                             bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)
-    proc = AutoProcessor.from_pretrained(MODEL_ID)
-    mdl  = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-               MODEL_ID, quantization_config=bnb, device_map="auto", dtype=torch.bfloat16)
-    mdl.eval()
-    return mdl, proc, device
-
-model, processor, device = load_model()
-st.success(f"Model ready | {device.upper()}")
-
-SYSTEM = (
-    "You are a senior QA engineer. Given requirements, output a JSON array of test cases ONLY.\n"
-    'Format: [{"id":"TC-001","title":"...","type":"positive|negative|boundary",'
-    '"priority":"high|medium|low","preconditions":"...","steps":["..."],'
-    '"expected_result":"...","tags":["..."]}]\n'
-    "Minimum 10 test cases. No markdown, no explanation, JSON only."
+st.set_page_config(
+    page_title="🧪 Test Case Generator",
+    page_icon="🧪",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-def generate(tz, n=10):
-    if len(tz) > 3000: tz = tz[:3000] + "\n...[truncated]"
-    msgs = [{"role":"system","content":SYSTEM},
-            {"role":"user","content":f"Requirements:\n\n{tz}\n\nGenerate {n} test cases."}]
-    text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-    inp  = processor(text=[text], return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        out = model.generate(**inp, max_new_tokens=2500, do_sample=True,
-                             temperature=0.3, top_p=0.9, repetition_penalty=1.1,
-                             pad_token_id=processor.tokenizer.eos_token_id)
-    raw = processor.tokenizer.decode(out[0][inp["input_ids"].shape[1]:], skip_special_tokens=True).strip()
-    raw = re.sub(r"```(?:json)?","",raw).strip().rstrip("`").strip()
-    m = re.search(r"\[.*\]", raw, re.DOTALL)
-    if m:
-        try: return json.loads(m.group())
-        except: pass
-    try: return json.loads(raw)
-    except: return []
+st.markdown("""
+<style>
+.metric-card {
+    background: #f8f9fa;
+    border-radius: 10px;
+    padding: 16px 20px;
+    text-align: center;
+    border: 1px solid #e9ecef;
+}
+.metric-val { font-size: 32px; font-weight: 700; margin: 0; }
+.metric-lbl { font-size: 13px; color: #6c757d; margin: 0; }
+</style>
+""", unsafe_allow_html=True)
 
-def to_excel(tcs):
-    wb = openpyxl.Workbook(); ws = wb.active; ws.title="Test Cases"
-    hdrs = ["ID","Title","Type","Priority","Preconditions","Steps","Expected Result","Tags"]
-    hf = PatternFill("solid", fgColor="1F4E79"); hfont = Font(bold=True, color="FFFFFF")
-    for c, h in enumerate(hdrs,1):
-        cell=ws.cell(row=1,column=c,value=h); cell.fill=hf; cell.font=hfont
-        cell.alignment=Alignment(horizontal="center")
-    colors={"positive":"E8F5E9","negative":"FFEBEE","boundary":"FFF8E1"}
-    for r,tc in enumerate(tcs,2):
-        fill=PatternFill("solid",fgColor=colors.get(tc.get("type",""),"FFFFFF"))
-        vals=[tc.get("id"),tc.get("title"),tc.get("type"),tc.get("priority"),
-              tc.get("preconditions"),"\n".join(f"{i+1}. {s}" for i,s in enumerate(tc.get("steps",[]))),
-              tc.get("expected_result"),", ".join(tc.get("tags",[]))]
-        for c,v in enumerate(vals,1):
-            cell=ws.cell(row=r,column=c,value=v); cell.fill=fill
-            cell.alignment=Alignment(wrap_text=True,vertical="top")
-    for c,w in zip(range(1,9),[10,35,12,10,30,50,35,20]):
-        ws.column_dimensions[get_column_letter(c)].width=w
-    ws.auto_filter.ref=ws.dimensions; ws.freeze_panes="A2"
-    buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+# ── API URL ──────────────────────────────────────────────────────────────────
+api_url = st.secrets.get("COLAB_API_URL", "") if hasattr(st, "secrets") else ""
 
-# Sidebar
+# Всегда показываем поле ввода в сайдбаре
 with st.sidebar:
-    st.header("Settings")
-    n_cases = st.slider("Number of test cases", 5, 20, 10)
-    ftype   = st.multiselect("Filter by type",     ["positive","negative","boundary"], default=["positive","negative","boundary"])
-    fprio   = st.multiselect("Filter by priority", ["high","medium","low"],            default=["high","medium","low"])
+    st.title("🧪 Test Case Generator")
+    st.caption("Powered by Qwen2.5-VL-3B в Colab")
+    st.divider()
+    st.subheader("🔗 Подключение к Colab")
+    api_url_input = st.text_input(
+        "Colab API URL",
+        value=api_url,
+        placeholder="https://xxxx.trycloudflare.com",
+        help="Скопируй URL из последней ячейки ноутбука в Colab",
+    )
+    if api_url_input:
+        api_url = api_url_input.strip().rstrip("/")
+    if api_url:
+        try:
+            r = requests.get(f"{api_url}/health", timeout=5)
+            if r.status_code == 200:
+                st.success("✅ Модель подключена")
+                st.caption(r.json().get("model", ""))
+            else:
+                st.error("❌ Модель не отвечает")
+        except Exception:
+            st.error("❌ Нет соединения")
+    else:
+        st.warning("⬆️ Введи URL выше")
+    st.divider()
 
-# Input
-st.header("Requirements Input")
-tab1, tab2 = st.tabs(["Text input", "Upload PDF/DOCX"])
+    st.subheader("⚙️ Настройки")
+    n_cases = st.slider("Количество тест-кейсов", 5, 20, 10)
+
+    st.markdown("**Типы сценариев**")
+    col_a, col_b, col_c = st.columns(3)
+    with col_a: inc_pos = st.checkbox("✅ Pos",  value=True)
+    with col_b: inc_neg = st.checkbox("❌ Neg",  value=True)
+    with col_c: inc_bnd = st.checkbox("⚠️ Bnd", value=True)
+
+    st.markdown("**Приоритеты**")
+    col_d, col_e, col_f = st.columns(3)
+    with col_d: inc_hi  = st.checkbox("🔴 High",   value=True)
+    with col_e: inc_med = st.checkbox("🟡 Med",    value=True)
+    with col_f: inc_lo  = st.checkbox("🟢 Low",    value=True)
+
+    lang = st.selectbox("Язык", ["Russian", "English"])
+    st.divider()
+    st.caption("Model: Qwen2.5-VL-3B-Instruct")
+
+if not api_url:
+    st.title("🧪 Test Case Generator")
+    st.info("👈 Вставь Colab API URL в боковой панели")
+    st.markdown("""
+    **Как получить URL:**
+    1. Открой ноутбук `HW25_testcase_generator.ipynb` в Colab
+    2. Запусти все ячейки по порядку
+    3. В последней ячейке появится ссылка вида `https://xxxx.trycloudflare.com`
+    4. Вставь её сюда
+    """)
+    st.stop()
+
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+def to_str(v):
+    if isinstance(v, list): return ", ".join(str(x) for x in v)
+    return str(v) if v is not None else ""
+
+def generate_test_cases(tz_text: str) -> list[dict]:
+    payload = {"tz_text": tz_text, "n_cases": n_cases, "language": lang}
+    try:
+        r = requests.post(
+            f"{api_url}/generate",
+            json=payload,
+            timeout=180,  # модель может генерировать 1-2 минуты
+        )
+        r.raise_for_status()
+        return r.json().get("test_cases", [])
+    except requests.exceptions.Timeout:
+        st.error("Timeout — модель генерирует слишком долго. Уменьши количество тест-кейсов.")
+        return []
+    except requests.exceptions.ConnectionError:
+        st.error("Нет соединения с Colab. Проверь что туннель запущен.")
+        return []
+    except Exception as e:
+        st.error(f"Ошибка: {e}")
+        return []
+
+def to_excel(tcs: list[dict]) -> io.BytesIO:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Test Cases"
+    headers = ["ID","Title","Type","Priority","Preconditions","Steps","Expected Result","Tags"]
+    hf = PatternFill("solid", fgColor="1F4E79")
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.fill = hf
+        cell.font = Font(bold=True, color="FFFFFF", size=11)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    colors = {"positive":"E8F5E9","negative":"FFEBEE","boundary":"FFF8E1"}
+    for row, tc in enumerate(tcs, 2):
+        fill = PatternFill("solid", fgColor=colors.get(tc.get("type",""),"FFFFFF"))
+        steps_raw = tc.get("steps", [])
+        if isinstance(steps_raw, str): steps_raw = [steps_raw]
+        steps_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps_raw))
+        vals = [to_str(tc.get("id")), to_str(tc.get("title")), to_str(tc.get("type")),
+                to_str(tc.get("priority")), to_str(tc.get("preconditions")),
+                steps_text, to_str(tc.get("expected_result")),
+                ", ".join(str(t) for t in (tc.get("tags") or []))]
+        for col, v in enumerate(vals, 1):
+            cell = ws.cell(row=row, column=col, value=v)
+            cell.fill = fill
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    for col, w in zip(range(1,9), [10,35,12,10,30,50,35,20]):
+        ws.column_dimensions[get_column_letter(col)].width = w
+    ws.auto_filter.ref = ws.dimensions
+    ws.freeze_panes = "A2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+st.title("🧪 Test Case Generator из ТЗ")
+st.markdown("Загрузи ТЗ — Qwen2.5-VL-3B сгенерирует тест-кейсы")
+
+tab1, tab2 = st.tabs(["✏️ Текст", "📁 Файл (PDF / DOCX)"])
 tz_text = ""
-with tab1:
-    inp = st.text_area("Paste requirements text:", height=300)
-    if inp: tz_text = inp
-with tab2:
-    f = st.file_uploader("Upload PDF or DOCX", type=["pdf","docx","doc"])
-    if f:
-        suf = Path(f.name).suffix.lower()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suf) as tmp:
-            tmp.write(f.read()); tp=tmp.name
-        if suf==".pdf":
-            import fitz
-            doc=fitz.open(tp); tz_text="\n\n".join(p.get_text() for p in doc); doc.close()
-        elif suf in (".docx",".doc"):
-            from docx import Document
-            doc=Document(tp); tz_text="\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
-        st.success(f"Loaded: {f.name} ({len(tz_text)} chars)")
-        with st.expander("Preview"): st.text(tz_text[:2000])
 
-if tz_text:
-    st.info(f"Requirements: {len(tz_text)} chars")
-    if st.button("Generate Test Cases", type="primary", use_container_width=True):
-        with st.spinner("Generating..."):
-            st.session_state["tcs"] = generate(tz_text, n_cases)
+with tab1:
+    inp = st.text_area("Текст ТЗ:", height=280,
+                        placeholder="Вставьте текст технического задания...")
+    if inp:
+        tz_text = inp
+        st.caption(f"{len(tz_text):,} символов")
+
+with tab2:
+    uploaded = st.file_uploader("PDF или DOCX", type=["pdf","docx","doc"])
+    if uploaded:
+        import tempfile
+        from pathlib import Path
+        suf = Path(uploaded.name).suffix.lower()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suf) as tmp:
+            tmp.write(uploaded.read()); tmp_path = tmp.name
+        try:
+            if suf == ".pdf":
+                import fitz
+                doc = fitz.open(tmp_path)
+                tz_text = "\n\n".join(p.get_text() for p in doc)
+                doc.close()
+            elif suf in (".docx", ".doc"):
+                from docx import Document
+                doc = Document(tmp_path)
+                tz_text = "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            st.success(f"✅ {uploaded.name} — {len(tz_text):,} символов")
+            with st.expander("Просмотр"):
+                st.text(tz_text[:2000] + ("..." if len(tz_text) > 2000 else ""))
+        except Exception as e:
+            st.error(f"Ошибка: {e}")
+
+st.divider()
+if st.button("🚀 Генерировать тест-кейсы", type="primary",
+             use_container_width=True, disabled=not bool(tz_text)):
+    with st.spinner("Qwen2.5-VL-3B генерирует тест-кейсы... (~1-2 мин)"):
+        tcs = generate_test_cases(tz_text)
+        if tcs:
+            st.session_state["tcs"] = tcs
+            st.success(f"✅ Сгенерировано {len(tcs)} тест-кейсов")
+        else:
+            st.error("Не удалось сгенерировать. Проверь соединение с Colab.")
 
 if "tcs" in st.session_state and st.session_state["tcs"]:
-    tcs = [tc for tc in st.session_state["tcs"]
-           if tc.get("type") in ftype and tc.get("priority") in fprio]
-
-    st.header(f"Test Cases ({len(tcs)})")
-    c1,c2,c3,c4 = st.columns(4)
     all_tcs = st.session_state["tcs"]
-    c1.metric("Total",    len(all_tcs))
-    c2.metric("Positive", sum(1 for t in all_tcs if t.get("type")=="positive"))
-    c3.metric("Negative", sum(1 for t in all_tcs if t.get("type")=="negative"))
-    c4.metric("Boundary", sum(1 for t in all_tcs if t.get("type")=="boundary"))
+    active_types = [t for t,on in [("positive",inc_pos),("negative",inc_neg),("boundary",inc_bnd)] if on]
+    active_prios = [p for p,on in [("high",inc_hi),("medium",inc_med),("low",inc_lo)] if on]
+    tcs = [tc for tc in all_tcs if tc.get("type") in active_types and tc.get("priority") in active_prios]
 
+    st.divider()
+    c1,c2,c3,c4 = st.columns(4)
+    with c1: st.markdown(f'<div class="metric-card"><p class="metric-val">{len(all_tcs)}</p><p class="metric-lbl">Всего</p></div>', unsafe_allow_html=True)
+    with c2: st.markdown(f'<div class="metric-card"><p class="metric-val" style="color:#28a745">{sum(1 for t in all_tcs if t.get("type")=="positive")}</p><p class="metric-lbl">✅ Positive</p></div>', unsafe_allow_html=True)
+    with c3: st.markdown(f'<div class="metric-card"><p class="metric-val" style="color:#dc3545">{sum(1 for t in all_tcs if t.get("type")=="negative")}</p><p class="metric-lbl">❌ Negative</p></div>', unsafe_allow_html=True)
+    with c4: st.markdown(f'<div class="metric-card"><p class="metric-val" style="color:#fd7e14">{sum(1 for t in all_tcs if t.get("type")=="boundary")}</p><p class="metric-lbl">⚠️ Boundary</p></div>', unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
     col1, col2 = st.columns(2)
     with col1:
-        st.download_button("Download Excel", to_excel(tcs), "test_cases.xlsx",
+        st.download_button("📥 Excel (Zephyr/Jira)", to_excel(tcs), "test_cases.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                            use_container_width=True)
     with col2:
-        st.download_button("Download JSON", json.dumps(tcs, ensure_ascii=False, indent=2),
+        st.download_button("📥 JSON (Zephyr API)", json.dumps(tcs, ensure_ascii=False, indent=2),
                            "test_cases.json", "application/json", use_container_width=True)
 
-    icons_t = {"positive":"OK","negative":"FAIL","boundary":"EDGE"}
-    icons_p = {"high":"HIGH","medium":"MED","low":"LOW"}
+    st.subheader(f"📋 Тест-кейсы ({len(tcs)} из {len(all_tcs)})")
+    ti = {"positive":"✅","negative":"❌","boundary":"⚠️"}
+    pi = {"high":"🔴","medium":"🟡","low":"🟢"}
     for tc in tcs:
-        with st.expander(f"[{icons_t.get(tc.get('type',''),'?')}] {tc.get('id','?')} - {tc.get('title','?')} [{icons_p.get(tc.get('priority','medium'),'?')}]"):
+        label = f"{ti.get(tc.get('type',''),'?')} **{tc.get('id','?')}** — {tc.get('title','?')}  {pi.get(tc.get('priority','medium'),'⚪')}"
+        with st.expander(label):
             l, r = st.columns([1,2])
             with l:
-                st.markdown(f"**Type:** {tc.get('type')}")
-                st.markdown(f"**Priority:** {tc.get('priority')}")
-                st.markdown(f"**Preconditions:** {tc.get('preconditions')}")
-                if tc.get("tags"): st.markdown("**Tags:** " + " ".join(f"`{t}`" for t in tc["tags"]))
+                st.markdown(f"**Тип:** `{tc.get('type')}`")
+                st.markdown(f"**Приоритет:** `{tc.get('priority')}`")
+                st.markdown(f"**Предусловия:**  \n{to_str(tc.get('preconditions','—'))}")
+                if tc.get("tags"):
+                    st.markdown("**Теги:** " + " ".join(f"`{t}`" for t in tc["tags"]))
             with r:
-                st.markdown("**Steps:**")
-                for i, s in enumerate(tc.get("steps",[]),1): st.markdown(f"{i}. {s}")
-                st.success(f"**Expected:** {tc.get('expected_result')}")
+                st.markdown("**Шаги:**")
+                steps = tc.get("steps",[])
+                if isinstance(steps, str): steps = [steps]
+                for idx, step in enumerate(steps, 1):
+                    st.markdown(f"{idx}. {step}")
+                st.success(f"**Ожидаемый результат:**  \n{to_str(tc.get('expected_result','—'))}")
 elif tz_text:
-    st.info("Press Generate button")
+    st.info("👆 Нажми «Генерировать тест-кейсы»")
 else:
-    st.warning("Enter requirements text or upload a file")
+    st.info("👆 Введи текст ТЗ или загрузи файл")
